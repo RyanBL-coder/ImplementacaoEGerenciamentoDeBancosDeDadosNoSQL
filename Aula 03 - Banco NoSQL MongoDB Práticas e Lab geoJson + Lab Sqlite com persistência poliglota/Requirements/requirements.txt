@@ -1,0 +1,5 @@
+requests==2.31.0
+pandas==2.0.3
+geopandas==0.13.2
+pymongo==4.4.1
+shapely==2.0.1

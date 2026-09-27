@@ -1,0 +1,85 @@
+import requests
+import json
+
+RIAK_URL = "http://localhost:8098"
+
+# -------------------------------
+# Funções utilitárias
+# -------------------------------
+
+def inserir_objeto(bucket_type, bucket, key, data, indexes=None):
+    url = f"{RIAK_URL}/types/{bucket_type}/buckets/{bucket}/keys/{key}"
+    headers = {"Content-Type": "application/json"}
+
+    # adiciona índices secundários (2i) se existirem
+    if indexes:
+        for nome, valor in indexes.items():
+            headers[f"x-riak-index-{nome}"] = valor
+
+    r = requests.put(url, headers=headers, data=json.dumps(data))
+    print(f"Inserção [{key}] status:", r.status_code)
+
+
+def buscar_por_chave(bucket_type, bucket, key):
+    url = f"{RIAK_URL}/types/{bucket_type}/buckets/{bucket}/keys/{key}"
+    r = requests.get(url)
+    if r.status_code == 200:
+        return r.json()
+    return None
+
+
+def buscar_por_indice(bucket_type, bucket, index, value):
+    url = f"{RIAK_URL}/types/{bucket_type}/buckets/{bucket}/index/{index}/{value}"
+    r = requests.get(url)
+    return r.json() if r.status_code == 200 else None
+
+
+def incrementar_contador(bucket, key, valor=1):
+    url = f"{RIAK_URL}/buckets/{bucket}/counters/{key}"
+    r = requests.post(url, data=str(valor))
+    print(f"Incremento contador [{key}] status:", r.status_code)
+
+
+def ler_contador(bucket, key):
+    url = f"{RIAK_URL}/buckets/{bucket}/counters/{key}"
+    r = requests.get(url)
+    if r.status_code == 200:
+        return int(r.text)
+    return None
+
+
+# -------------------------------
+# Exemplo de uso
+# -------------------------------
+if __name__ == "__main__":
+    # Inserir objetos no bucket "dogs"
+    inserir_objeto(
+        bucket_type="animals",
+        bucket="dogs",
+        key="rufus",
+        data={"name": "Rufus", "breed": "Labrador", "owner": "Ana"},
+        indexes={"species_bin": "dog", "age_int": "5"},
+    )
+
+    inserir_objeto(
+        bucket_type="animals",
+        bucket="dogs",
+        key="kira",
+        data={"name": "Kira", "breed": "Border Collie", "owner": "Bruno"},
+        indexes={"species_bin": "dog", "age_int": "2"},
+    )
+
+    # Buscar por chave
+    print("\n🔹 Buscar chave 'rufus':")
+    print(buscar_por_chave("animals", "dogs", "rufus"))
+
+    # Buscar por índice
+    print("\n🔹 Buscar por índice species_bin=dog:")
+    print(buscar_por_indice("animals", "dogs", "species_bin", "dog"))
+
+    # Contadores (page views)
+    print("\n🔹 Incrementar contador 'home_views':")
+    incrementar_contador("metrics", "home_views", 1)
+
+    print("🔹 Valor atual do contador 'home_views':")
+    print(ler_contador("metrics", "home_views"))
