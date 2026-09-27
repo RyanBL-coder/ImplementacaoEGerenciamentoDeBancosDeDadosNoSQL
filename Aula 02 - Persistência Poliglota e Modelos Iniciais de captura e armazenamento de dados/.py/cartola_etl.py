@@ -1,7 +1,18 @@
+"""
+cartola_etl.py
+--------------
+ETL da API do Cartola FC -> MongoDB.
+
+Fonte:  https://api.cartola.globo.com/atletas/mercado
+Banco:  cartola_fc_db
+Coleções:
+    - mercado_rodada_atual
+    - atletas_rodada_atual
+    - clubes_rodada_atual
+"""
 
 import os
 import sys
-import json
 import time
 import logging
 from datetime import datetime, timezone
@@ -9,11 +20,17 @@ from typing import Any, Dict, List, Optional
 
 import requests
 from pymongo import MongoClient, UpdateOne
+from pymongo.database import Database
 from pymongo.errors import PyMongoError
 from dotenv import load_dotenv
 
 # ========================================================
-# Configuração de logging
+# 0. Carrega .env ANTES de ler qualquer variável
+# ========================================================
+load_dotenv()
+
+# ========================================================
+# 1. Logging
 # ========================================================
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -21,110 +38,96 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%SZ",
 )
-# Força timestamps em UTC no logger
 logging.Formatter.converter = time.gmtime
 
 # ========================================================
-# Constantes e configuração
+# 2. Constantes e configuração
 # ========================================================
 API_BASE_URL = "https://api.cartola.globo.com"
 MERCADO_ENDPOINT = f"{API_BASE_URL}/atletas/mercado"
 
-load_dotenv()  # lê .env, se existir
-
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "database_cartola_fc")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "cartola_fc_db")
 
-# Coleções
-COL_CLUBES = "clubes"
-COL_ATLETAS = "atletas"
-COL_MERCADO = "mercado"
+# Nomes das collections — conforme o PDF
+COL_CLUBES = "clubes_rodada_atual"
+COL_ATLETAS = "atletas_rodada_atual"
+COL_MERCADO = "mercado_rodada_atual"
 
 
 # ========================================================
-# Utilidades
+# 3. Utilidades
 # ========================================================
 def iso_utc_now() -> str:
-    """Retorna timestamp ISO-8601 em UTC."""
+    """Retorna timestamp ISO-8601 em UTC (sem microssegundos)."""
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
 # ========================================================
-# Módulo de Conexão
+# 4. Conexão MongoDB
 # ========================================================
-def conectar_mongodb() -> MongoClient:
-    """Estabelece conexão com o MongoDB e retorna o objeto de banco (db)."""
+def conectar_mongodb() -> Database:
+    """Conecta ao MongoDB e retorna o objeto de banco (db)."""
     try:
         client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=8000)
-        # Força uma chamada para validar a conexão
         client.admin.command("ping")
         db = client[MONGO_DB_NAME]
-        logging.info("Conectado ao MongoDB com sucesso.")
+        logging.info("Conectado ao MongoDB (db=%s).", MONGO_DB_NAME)
         return db
-    except Exception as e:
+    except PyMongoError as e:
         logging.exception("Falha ao conectar no MongoDB: %s", e)
         raise
 
 
 # ========================================================
-# Módulo de Extração
+# 5. Extração
 # ========================================================
 def buscar_dados_mercado(session: Optional[requests.Session] = None) -> Dict[str, Any]:
-    """Busca dados do endpoint de mercado no Cartola FC.
+    """Busca o JSON do endpoint de mercado do Cartola FC.
 
-    Args:
-        session: requests.Session opcional para reuso de conexão.
-
-    Returns:
-        dict com o JSON da resposta.
+    Faz retry com backoff exponencial em caso de falha.
     """
     sess = session or requests.Session()
     headers = {
         "Accept": "application/json",
-        "User-Agent": "cartola-etl/1.0 (+https://example.internal)",
+        "User-Agent": "cartola-etl/1.0",
     }
 
-    # Retry simples com backoff exponencial
     max_tentativas = 3
     for tentativa in range(1, max_tentativas + 1):
         try:
             resp = sess.get(MERCADO_ENDPOINT, headers=headers, timeout=30)
             resp.raise_for_status()
-            logging.info("Dados de mercado obtidos com sucesso (tentativa %d).", tentativa)
+            logging.info("Dados de mercado obtidos (tentativa %d).", tentativa)
             return resp.json()
         except requests.RequestException as e:
-            logging.warning("Erro na requisição (tentativa %d/%d): %s", tentativa, max_tentativas, e)
+            logging.warning("Erro na requisição (%d/%d): %s",
+                            tentativa, max_tentativas, e)
             if tentativa == max_tentativas:
-                logging.exception("Falha ao buscar dados do mercado após %d tentativas.", max_tentativas)
+                logging.exception("Falha ao buscar mercado após %d tentativas.",
+                                  max_tentativas)
                 raise
-            time.sleep(2 ** tentativa)  # backoff: 2, 4
+            time.sleep(2 ** tentativa)
 
 
 # ========================================================
-# Módulo de Transformação e Carga (ETL Core)
+# 6. Transformação e Carga
 # ========================================================
-def processar_e_gravar_dados(db, dados_mercado: Dict[str, Any]) -> None:
-    """Processa o JSON de mercado e grava nas coleções do MongoDB.
-
-    - clubes_rodada_atual: upsert por _id (id do clube).
-    - atletas_rodada_atual: substitui documentos pela coleta atual (limpa e insere).
-    - mercado_rodada_atual: mantém somente o status mais recente (limpa e insere).
-    """
+def processar_e_gravar_dados(db: Database, dados_mercado: Dict[str, Any]) -> None:
+    """Separa clubes/atletas/mercado e grava nas respectivas collections."""
     timestamp = iso_utc_now()
 
-    # --------- 1) Clubes ---------
+    # ---------- 6.1 Clubes ----------
     clubes_obj = dados_mercado.get("clubes", {})
     if isinstance(clubes_obj, dict):
-        # Em geral, "clubes" vem como dict { "ID": {dados}, ... }
         ops: List[UpdateOne] = []
         for club_id_str, club_data in clubes_obj.items():
             try:
                 club_id = int(club_id_str)
             except (TypeError, ValueError):
-                # Às vezes já vem inteiro; tentar pegar do campo 'id'
                 club_id = club_data.get("id")
                 if club_id is None:
-                    logging.warning("Clube com ID inválido será ignorado: %s", club_data)
+                    logging.warning("Clube com ID inválido ignorado: %s", club_data)
                     continue
 
             doc = {
@@ -135,40 +138,34 @@ def processar_e_gravar_dados(db, dados_mercado: Dict[str, Any]) -> None:
                 "nome_fantasia": club_data.get("nome_fantasia"),
                 "timestamp_coleta": timestamp,
             }
-            ops.append(
-                UpdateOne(
-                    {"_id": doc["_id"]},
-                    {"$set": doc},
-                    upsert=True,
-                )
-            )
+            ops.append(UpdateOne({"_id": doc["_id"]}, {"$set": doc}, upsert=True))
 
         if ops:
             try:
                 result = db[COL_CLUBES].bulk_write(ops, ordered=False)
-                upserts = (result.upserted_count or 0)
-                modified = (result.modified_count or 0)
-                logging.info("Clubes upsert: %d, modificados: %d.", upserts, modified)
+                logging.info(
+                    "Clubes upsert: %d, modificados: %d.",
+                    result.upserted_count or 0,
+                    result.modified_count or 0,
+                )
             except PyMongoError as e:
                 logging.exception("Erro ao gravar clubes: %s", e)
                 raise
     else:
         logging.warning("Campo 'clubes' não está no formato esperado (dict).")
 
-
-    # --------- 2) Atletas ---------
+    # ---------- 6.2 Atletas ----------
     atletas_list = dados_mercado.get("atletas", [])
     if not isinstance(atletas_list, list):
-        logging.warning("Campo 'atletas' não é uma lista. Valor: %s", type(atletas_list))
+        logging.warning("Campo 'atletas' não é lista (%s).", type(atletas_list))
         atletas_list = []
 
     for atleta in atletas_list:
         atleta["timestamp_coleta"] = timestamp
 
     try:
-        # Mantém apenas a coleta atual
         delete_res = db[COL_ATLETAS].delete_many({})
-        logging.info("Removidos %d documentos antigos de atletas.", delete_res.deleted_count)
+        logging.info("Removidos %d atletas antigos.", delete_res.deleted_count)
         if atletas_list:
             db[COL_ATLETAS].insert_many(atletas_list, ordered=False)
             logging.info("Inseridos %d atletas.", len(atletas_list))
@@ -178,27 +175,28 @@ def processar_e_gravar_dados(db, dados_mercado: Dict[str, Any]) -> None:
         logging.exception("Erro ao gravar atletas: %s", e)
         raise
 
+    # ---------- 6.3 Status do mercado ----------
+    status_obj = dados_mercado.get("status", {}) or {}
 
-    # --------- 3) Status/Mercado ---------
-    # Alguns campos úteis: rodada_atual, status_mercado, aviso, fechamento{...}
     mercado_doc = {
         "rodada_atual": dados_mercado.get("rodada_atual"),
-        "status_mercado": dados_mercado.get("status_mercado"),
-        "aviso": dados_mercado.get("aviso"),
-        "fechamento": dados_mercado.get("fechamento"),
+        "status_mercado": status_obj.get("mercado"),
+        "aviso": status_obj.get("aviso"),
+        "fechamento": status_obj.get("fechamento"),
         "timestamp_coleta": timestamp,
     }
 
     try:
-        db[COL_MERCADO].delete_many({})  # mantém apenas o status mais recente
+        db[COL_MERCADO].delete_many({})
         db[COL_MERCADO].insert_one(mercado_doc)
         logging.info("Status do mercado gravado com sucesso.")
     except PyMongoError as e:
-        logging.exception("Erro ao gravar status do mercado: %s", e)
+        logging.exception("Erro ao gravar mercado: %s", e)
         raise
 
+
 # ========================================================
-# Orquestração
+# 7. Orquestração
 # ========================================================
 def main() -> int:
     logging.info("Iniciando ETL Cartola FC...")
