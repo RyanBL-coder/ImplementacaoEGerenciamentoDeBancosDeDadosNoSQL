@@ -1,3 +1,4 @@
+# Dependências dos ETLs: Cartola FC (cartola_etl.py) e OpenF1 (f1_data_collector.py)
 requests
 pymongo
 python-dotenv
